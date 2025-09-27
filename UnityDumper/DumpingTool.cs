@@ -5,9 +5,10 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace UnityDumper
 {
-    public class DumpingTool
+    public partial class DumpingTool
     {
-        static void Main(string[] args)
+        // In the main function all operations start
+        static async Task Main(string[] args)
         {
             if (args.Length < 2)
             {
@@ -17,22 +18,32 @@ namespace UnityDumper
 
             string inputFolder = args[0];
             string outputFolder = args[1];
-            Directory.CreateDirectory(outputFolder);
-            
-            var guidMap = CollectGuids(inputFolder);
-            var usedGuids = FindReferencedGuids(inputFolder);
-            
-            var unused = DetectUnusedScripts(guidMap, usedGuids);
-            
-            DumpUnusedScripts(outputFolder, unused);
-            DumpSceneHierarchies(inputFolder, outputFolder);
+            /* The function that dumps unused scripts runs parallel with the function that dumps
+             scene hierarchies. */
+            await Task.Run(() =>
+            {
+                Directory.CreateDirectory(outputFolder);
+                Parallel.Invoke(
+                    () =>
+                    {
+                        var guidMap = CollectGuids(inputFolder);
+                        var usedGuids = FindReferencedGuids(inputFolder);
+
+                        var unused = DetectUnusedScripts(guidMap, usedGuids);
+
+                        DumpUnusedScripts(outputFolder, unused);
+                    },
+                    () => DumpSceneHierarchies(inputFolder, outputFolder));
+            });
         }
 
+        //This function collects all the guids from the meta files in the "Assets" folder
         static Dictionary<string, string> CollectGuids(string root)
         {
             var map = new Dictionary<string, string>();
             foreach (var file in Directory.EnumerateFiles(root, "*.meta", SearchOption.AllDirectories))
             {
+                // This line checks if the file is in the "Assets" folder
                 if (!file.Replace("\\", "/").Contains("/Assets/")) continue;
                 foreach (var line in File.ReadLines(file))
                 {
@@ -47,9 +58,10 @@ namespace UnityDumper
             return map;
         }
 
+        // This function finds guids that are referenced in a Unity scene
         static HashSet<string> FindReferencedGuids(string root)
         {
-            var regex = new Regex(@"guid: ([a-f0-9]{32})");
+            var regex = MyRegex();
             var used = new HashSet<string>();
 
             foreach (var file in Directory.EnumerateFiles(Path.Combine(root, "Assets"), "*.*", 
@@ -58,7 +70,7 @@ namespace UnityDumper
                 foreach (var line in File.ReadLines(file))
                 {
                     var match = regex.Match(line);
-                    if (match.Success)
+                    if (match.Success && line.Contains("m_"))
                     {
                         used.Add(match.Groups[1].Value);
                     }
@@ -68,6 +80,7 @@ namespace UnityDumper
             return used;
         }
 
+        //This bool checks if the code contains serialized fields
         static bool HasSerializedFields(string scriptPath)
         {
             try
@@ -98,6 +111,7 @@ namespace UnityDumper
             }
         }
 
+        //This function checks the code for unused scripts
         static List<(string Path, string Guid)> DetectUnusedScripts(Dictionary<string, string> guidMap,
             HashSet<string> used)
         {
@@ -106,24 +120,6 @@ namespace UnityDumper
             {
                 if(!kv.Value.EndsWith(".cs")) continue;
                 if(!kv.Value.Replace("\\", "/").Contains("/Assets/")) continue;
-                
-                /*var code = File.ReadAllText(kv.Value);
-                var tree =  CSharpSyntaxTree.ParseText(code);
-                var root = tree.GetRoot();
-                
-                var classes = root.DescendantNodes().OfType<ClassDeclarationSyntax>();
-                bool hasMonoBehaviour = false;
-
-                foreach (var cls in classes)
-                {
-                    var baseTypes =  cls.BaseList?.Types.Select(t => t.ToString()) 
-                                     ?? Enumerable.Empty<string>();
-                    if (baseTypes.Any(bt => bt.Contains("MonoBehaviour")))
-                    {
-                        hasMonoBehaviour = true;
-                        break;
-                    }
-                }*/
 
                 if (!HasSerializedFields(kv.Value) && !used.Contains(kv.Key))
                 {
@@ -140,23 +136,34 @@ namespace UnityDumper
             return unused.OrderBy(x => x.Path).ToList();
         }
 
+        // This function Dumps all the unused scripts
         static void DumpUnusedScripts(string outputFolder, List<(string Path, string Guid)> unused)
         {
             string csvPath = Path.Combine(outputFolder, "UnusedScripts.csv");
-            using var writer = new StreamWriter(csvPath);
-            writer.WriteLine("Relative Path,GUID");
-            foreach (var (path, guid) in unused)
+
+            try
             {
-                writer.WriteLine($"{path},{guid}");
+                using var writer = new StreamWriter(csvPath);
+                writer.WriteLine("Relative Path,GUID");
+
+                foreach (var (path, guid) in unused)
+                {
+                    writer.WriteLine($"{path},{guid}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Unexpected error writing CSV '{csvPath}': {ex.Message}");
             }
         }
         
+        // This function dumps the hierarchies of all the scenes in the "Assets" folder
         static void DumpSceneHierarchies(string inputFolder, string outputFolder)
         {
             string assetsFolder = Path.Combine(inputFolder, "Assets");
             if (!Directory.Exists(assetsFolder)) return;
             
-            foreach (var sceneFile in Directory.EnumerateFiles(inputFolder, "*.unity", SearchOption.AllDirectories))
+            foreach (var sceneFile in Directory.EnumerateFiles(assetsFolder, "*.unity", SearchOption.AllDirectories))
             {
                 string sceneName = Path.GetFileNameWithoutExtension(sceneFile);
                 string outputPath = Path.Combine(outputFolder, $"{sceneName}.unity.dump");
@@ -164,22 +171,26 @@ namespace UnityDumper
             }
         }
 
+        // This function handles the process of dumping the hierarchy of a scene
         static void DumpSceneHierarchy(string scenePath, string outputPath)
         {
             var objects = new Dictionary<string, (string Name, List<string> Children, string Parent)>();
             string? currentId = null;
             var idDictionary = new Dictionary<string, string?>();
 
+            // The loop adds all scene objects in the "objects" dictionary
             foreach (var raw in File.ReadLines(scenePath))
             {
                 var line = raw.TrimEnd();
 
+                // Assigns id's to each of the scene objects
                 if (line.StartsWith("--- !u!1 &"))
                 {
                     currentId = line.Split('&')[1];
                     objects[currentId] = ("", new List<string>(), null)!;
                     continue;
                 }
+                // Connects the id's of GameObjects and the transforms
                 if (line.StartsWith("--- !u!4 &"))
                 {
                     var transformId = line.Split('&')[1];
@@ -187,6 +198,7 @@ namespace UnityDumper
                     continue;
                 }
 
+                // Defines the name of a game object
                 if (currentId != null && line.Contains("m_Name:"))
                 {
                     string name = line.Split("m_Name:")[1].Trim().Trim('"');
@@ -206,6 +218,7 @@ namespace UnityDumper
                     continue;
                 }
 
+                // Determines if a game object has child objects or if it is a child object itself
                 if (currentId != null && line.Contains("m_Father: {fileID:"))
                 {
                     var parentTransformId = line.Split("fileID:")[1].Trim(' ', '}');
@@ -218,19 +231,20 @@ namespace UnityDumper
                 }
             }
             
+            // The objects that have no parent objects are placed at the roots of the hierarchy
             var roots = objects.Keys.Where(id => objects[id].Parent == null).ToList();
-            
-            using var writer = new StreamWriter(outputPath);
 
+            using var writer = new StreamWriter(outputPath);
+            
             foreach (var root in roots)
             {
                 WriteObject(writer, objects, root, 0);
             }
         }
 
+        // This function writes the hierarchy of the scene into the text file
         static void WriteObject(StreamWriter writer,
-            Dictionary<string, (string Name, List<string> Children, string Parent)> objects,
-            string id, int indent)
+            Dictionary<string, (string Name, List<string> Children, string Parent)> objects, string id, int indent)
         {
             if (!objects.TryGetValue(id, out var obj)) return;
             if (string.IsNullOrEmpty(obj.Name)) return;
@@ -241,6 +255,9 @@ namespace UnityDumper
                 WriteObject(writer, objects, child, indent + 1);
             }
         }
+
+        [GeneratedRegex(@"guid: ([a-f0-9]{32})")]
+        private static partial Regex MyRegex();
     }
 }
 
